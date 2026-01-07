@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,12 @@ class TrainingConfig:
     device: str = "cuda"
     mixed_precision: Optional[str] = None
     gradient_checkpointing: bool = False
+    # Wandb configuration
+    use_wandb: bool = True
+    wandb_project: str = "qwen25-sft"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -96,3 +102,4 @@ class TrainingConfig:
         config = cls.from_dict(config_dict)
         logger.info(f"Configuration loaded from {path}")
         return config
+

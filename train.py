@@ -49,6 +49,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip dependency validation before training"
     )
+    train_parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable wandb logging"
+    )
+    train_parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="Wandb project name (overrides config)"
+    )
+    train_parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Wandb run name (overrides config)"
+    )
     
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate configuration and data")
@@ -113,6 +130,14 @@ def cmd_train(args: argparse.Namespace) -> int:
         # Override device if specified
         if args.device:
             config.device = args.device
+        
+        # Override wandb settings if specified
+        if args.no_wandb:
+            config.use_wandb = False
+        if args.wandb_project:
+            config.wandb_project = args.wandb_project
+        if args.wandb_run_name:
+            config.wandb_run_name = args.wandb_run_name
         
         # Setup trainer
         trainer = Trainer(config)
@@ -246,3 +271,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

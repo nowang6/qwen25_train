@@ -23,6 +23,13 @@ from utils import MetricsLogger, save_checkpoint, load_checkpoint
 
 logger = logging.getLogger(__name__)
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    logger.warning("wandb not available. Install with: pip install wandb")
+
 
 class AlpacaDataset(Dataset):
     """Dataset class for Alpaca format data."""
@@ -63,7 +70,7 @@ class AlpacaDataset(Dataset):
             text,
             truncation=True,
             max_length=self.max_length,
-            padding="max_length",
+            padding=False,  # Use dynamic padding instead of max_length padding
             return_tensors="pt"
         )
         
@@ -101,6 +108,11 @@ class Trainer:
         # Setup metrics logger
         self.metrics_logger = MetricsLogger(str(self.output_dir))
         
+        # Initialize wandb if enabled
+        self.wandb_initialized = False
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            self._init_wandb()
+        
         # Initialize model, tokenizer, and data
         self._setup_model_and_tokenizer()
         self._setup_data()
@@ -136,16 +148,50 @@ class Trainer:
         
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True
+            torch_dtype=torch_dtype if torch_dtype else torch.float32,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True  # Reduce CPU memory usage during loading
         )
         
+        # Enable gradient checkpointing to save memory
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
         
         self.model = self.model.to(self.device)
         
+        # Log memory-saving settings
+        if torch_dtype:
+            logger.info(f"Using {self.config.mixed_precision} precision for memory efficiency")
+        else:
+            logger.warning("Mixed precision not enabled - consider enabling bf16/fp16 to save memory")
+        
         logger.info(f"Model loaded on {self.device}")
+    
+    def _init_wandb(self) -> None:
+        """Initialize wandb for experiment tracking."""
+        if not WANDB_AVAILABLE:
+            logger.warning("wandb not available, skipping initialization")
+            return
+        
+        # Generate run name if not provided
+        run_name = self.config.wandb_run_name
+        if not run_name:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_name = f"qwen25-sft-{timestamp}"
+        
+        # Initialize wandb
+        wandb.init(
+            project=self.config.wandb_project,
+            entity=self.config.wandb_entity,
+            name=run_name,
+            tags=self.config.wandb_tags or [],
+            config=self.config.to_dict(),
+            dir=str(self.output_dir)
+        )
+        
+        self.wandb_initialized = True
+        logger.info(f"Wandb initialized: project={self.config.wandb_project}, run={run_name}")
     
     def _setup_data(self) -> None:
         """Load and prepare training data."""
@@ -159,11 +205,47 @@ class Trainer:
             self.config.max_length
         )
         
+        # Custom collate function for dynamic padding
+        def collate_fn(batch):
+            """Collate function with dynamic padding to max length in batch."""
+            input_ids = [item["input_ids"] for item in batch]
+            attention_mask = [item["attention_mask"] for item in batch]
+            labels = [item["labels"] for item in batch]
+            
+            # Find max length in this batch
+            max_len = max(len(ids) for ids in input_ids)
+            max_len = min(max_len, self.config.max_length)  # Cap at max_length
+            
+            # Pad to max length in batch (not global max_length)
+            padded_input_ids = []
+            padded_attention_mask = []
+            padded_labels = []
+            
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            
+            for ids, attn, lbls in zip(input_ids, attention_mask, labels):
+                pad_length = max_len - len(ids)
+                if pad_length > 0:
+                    ids = torch.cat([ids, torch.full((pad_length,), pad_token_id, dtype=ids.dtype)])
+                    attn = torch.cat([attn, torch.zeros(pad_length, dtype=attn.dtype)])
+                    lbls = torch.cat([lbls, torch.full((pad_length,), -100, dtype=lbls.dtype)])  # -100 is ignored in loss
+                
+                padded_input_ids.append(ids[:max_len])
+                padded_attention_mask.append(attn[:max_len])
+                padded_labels.append(lbls[:max_len])
+            
+            return {
+                "input_ids": torch.stack(padded_input_ids),
+                "attention_mask": torch.stack(padded_attention_mask),
+                "labels": torch.stack(padded_labels)
+            }
+        
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=0
+            num_workers=0,
+            collate_fn=collate_fn
         )
         
         logger.info(f"Dataset loaded: {len(self.dataset)} samples")
@@ -227,10 +309,20 @@ class Trainer:
         logger.info("Starting training...")
         logger.info(f"Device: {self.device}")
         logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
+        logger.info(f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         logger.info(f"Learning rate: {self.config.learning_rate}")
         logger.info(f"Epochs: {self.config.num_epochs}")
+        logger.info(f"Mixed precision: {self.config.mixed_precision}")
+        logger.info(f"Gradient checkpointing: {self.config.gradient_checkpointing}")
         
         self.model.train()
+        
+        # Setup mixed precision scaler if using fp16
+        scaler = None
+        if self.config.mixed_precision == "fp16":
+            scaler = torch.cuda.amp.GradScaler()
+            logger.info("Using FP16 with automatic mixed precision (AMP)")
         
         for epoch in range(self.config.num_epochs):
             self.current_epoch = epoch
@@ -247,35 +339,66 @@ class Trainer:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 
-                # Forward pass
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                
-                loss = outputs.loss
-                loss = loss / self.config.gradient_accumulation_steps
-                
-                # Backward pass
-                loss.backward()
+                # Forward pass with mixed precision if enabled
+                if scaler is not None:
+                    # FP16 with AMP
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels
+                        )
+                        loss = outputs.loss
+                        loss = loss / self.config.gradient_accumulation_steps
+                    
+                    # Backward pass with scaler
+                    scaler.scale(loss).backward()
+                elif self.config.mixed_precision == "bf16":
+                    # BF16 with autocast
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels
+                        )
+                        loss = outputs.loss
+                        loss = loss / self.config.gradient_accumulation_steps
+                    
+                    loss.backward()
+                else:
+                    # Standard FP32
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+                    loss = loss / self.config.gradient_accumulation_steps
+                    loss.backward()
                 
                 epoch_loss += loss.item()
                 
                 # Update weights
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    # Calculate gradient norm before clipping (for logging)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
                     
-                    # Update parameters
-                    self.optimizer.step()
+                    # Clip gradients and update parameters
+                    if scaler is not None:
+                        scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        scaler.step(self.optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                    
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
                     
                     # Log metrics
                     current_lr = self.scheduler.get_last_lr()[0]
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
                     
                     metrics = {
                         "step": self.global_step,
@@ -286,6 +409,16 @@ class Trainer:
                     }
                     
                     self.metrics_logger.log(metrics)
+                    
+                    # Log to wandb
+                    if self.wandb_initialized:
+                        wandb.log({
+                            "train/loss": loss.item(),
+                            "train/learning_rate": current_lr,
+                            "train/gradient_norm": grad_norm.item(),
+                            "train/epoch": epoch + (batch_idx + 1) / len(self.dataloader),
+                            "train/step": self.global_step
+                        }, step=self.global_step)
                     
                     # Update progress bar
                     progress_bar.set_postfix({
@@ -299,6 +432,13 @@ class Trainer:
             
             avg_loss = epoch_loss / len(self.dataloader)
             logger.info(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
+            
+            # Log epoch metrics to wandb
+            if self.wandb_initialized:
+                wandb.log({
+                    "train/epoch_loss": avg_loss,
+                    "train/epoch": epoch + 1
+                }, step=self.global_step)
         
         # Save final checkpoint
         final_checkpoint_dir = self.output_dir / "checkpoint-final"
@@ -314,6 +454,11 @@ class Trainer:
         )
         
         logger.info("Training completed!")
+        
+        # Finish wandb run
+        if self.wandb_initialized:
+            wandb.finish()
+            logger.info("Wandb run finished")
     
     def resume_from_checkpoint(self, checkpoint_path: str) -> None:
         """Resume training from checkpoint.
@@ -331,3 +476,4 @@ class Trainer:
         )
         
         logger.info(f"Resumed at step {self.global_step}, epoch {self.current_epoch}")
+
