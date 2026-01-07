@@ -1,0 +1,17 @@
+{
+  "model_name": "./models/Qwen2.5-0.5B-Instruct",
+  "learning_rate": 0.0002,
+  "batch_size": 1,
+  "num_epochs": 3,
+  "max_length": 2048,
+  "checkpoint_steps": 1000,
+  "output_dir": "./output",
+  "data_file": "./data/train_alpaca.json",
+  "gradient_accumulation_steps": 1,
+  "warmup_steps": 100,
+  "logging_steps": 10,
+  "save_total_limit": 3,
+  "device": "cuda",
+  "mixed_precision": null,
+  "gradient_checkpointing": false
+}
