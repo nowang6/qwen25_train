@@ -69,10 +69,11 @@
 {
   "model_name": "./models/Qwen2.5-0.5B-Instruct",
   "data_file": "./data/train_alpaca.json",
-  "learning_rate": 0.0002,
+  "learning_rate": 1.0e-5,
   "batch_size": 4,
   "num_epochs": 3,
   "max_length": 2048,
+  "warmup_ratio": 0.1,
   "checkpoint_steps": 1000,
   "output_dir": "./output",
   "device": "cuda",
