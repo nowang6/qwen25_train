@@ -52,5 +52,4 @@ htmlcov/
 uv.lock
 
 models
-data
 output
